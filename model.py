@@ -219,6 +219,7 @@ class PVTModelIncr(PVTModel):
         return embedding_output, encoded_layers, pooled_output
 
 
+
 class LabelSmoothingLoss(_Loss):
     def __init__(self, label_smoothing=0, tgt_vocab_size=0, ignore_index=0, 
                  size_average=None, reduce=None, reduction='mean'):
@@ -250,4 +251,152 @@ class LabelSmoothingLoss(_Loss):
 
 
 
+class PVTForLM(PVTPreTrainedModel):
+    def __init__(self, config):
+        super(PVTForLM, self).__init__(config)
+        self.bert = PVTModel(config) 
+        # ffd -> hidden states 
+        self.cls = BertOnlyMLMHead(config)
+        self.crit_mask_lm = nn.CrossEntropyLoss(reduction='none')
+        if hasattr(config, 'label_smoothing') and config.label_smoothing:
+            self.crit_mask_lm_smoothed = LabelSmoothingLoss(
+                config.label_smoothing, config.vocab_size, ignore_index=0, reduction='none')
+        else:
+            self.crit_mask_lm_smoothed = None
+        
+        self.num_labels = 2 
+        # 2-type classifier 
+        self.cls2 = BertOnlyNSPHead(config)
+        self.crit_next_sent = nn.CrossEntropyLoss(ignore_index=-1)
+
+        self.init_weights()
+        self.tie_weights()
+
+    def tie_weights(self):
+        self._tie_or_clone_weights(self.cls.predictions.decoder,
+                                   self.bert.embeddings.word_embeddings)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, 
+                masked_lm_labels=None, masked_pos=None, masked_weights=None, next_sentence_label=None):
+        sequence_output, pooled_output = self.bert(
+            input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+
+        def gather_seq_out_by_pos(seq, pos):
+            return torch.gather(seq, 1, pos.unsqueeze(2).expand(-1, -1, seq.size(-1)))
+
+        def gather_seq_out_by_pos_average(seq, pos, mask):
+            batch_size, max_token_num = pos.size(0), pos.size(-1)
+            pos_vec = torch.gather(seq, 1, pos.view(batch_size, -1).unsqueeze(
+                2).expand(-1, -1, seq.size(-1))).view(batch_size, -1, max_token_num, seq.size(-1))
+            mask = mask.type_as(pos_vec)
+            pos_vec_masked_sum = (
+                pos_vec * mask.unsqueeze(3).expand_as(pos_vec)).sum(2)
+            return pos_vec_masked_sum / mask.sum(2, keepdim=True).expand_as(pos_vec_masked_sum)
+
+        def loss_mask_and_normalize(loss, mask):
+            mask = mask.type_as(loss)
+            loss = loss * mask
+            denominator = torch.sum(mask) + 1e-5
+            return (loss / denominator).sum()
+
+        if masked_lm_labels is None:
+            if masked_pos is None:
+                prediction_scores = self.cls(sequence_output)
+            else:
+                sequence_output_masked = gather_seq_out_by_pos(
+                    sequence_output, masked_pos)
+                prediction_scores = self.cls(sequence_output_masked)
+            return prediction_scores
+        sequence_output_masked = gather_seq_out_by_pos(
+            sequence_output, masked_pos)
+        prediction_scores_masked = self.cls(sequence_output_masked)
+
+        if self.crit_mask_lm_smoothed:
+            masked_lm_loss = self.crit_mask_lm_smoothed(
+                F.log_softmax(prediction_scores_masked.float(), dim=-1), masked_lm_labels)
+        else:
+            masked_lm_loss = self.crit_mask_lm(
+                prediction_scores_masked.transpose(1, 2).float(), masked_lm_labels)
+        masked_lm_loss = loss_mask_and_normalize(
+            masked_lm_loss.float(), masked_weights)
+
+        seq_relationship_score = self.cls2(pooled_output)
+
+        if next_sentence_label is None:
+            total_loss = masked_lm_loss
+        else:
+            next_sentence_loss = self.crit_next_sent(
+                seq_relationship_score.view(-1, self.num_labels).float(), next_sentence_label.view(-1))
+            total_loss = next_sentence_loss + masked_lm_loss
+        return total_loss
+
+
+
+class PVTForSeq2Seq(PVTPreTrainedModel):
+    """refer to BertForPreTraining"""
+    def __init__(self, config):
+        super(PVTForSeq2Seq, self).__init__(config)
+        self.bert = PVTModel(config)
+        self.cls = BertOnlyMLMHead(config)
+        self.crit_mask_lm = nn.CrossEntropyLoss(reduction='none')
+        if hasattr(config, 'label_smoothing') and config.label_smoothing:
+            self.crit_mask_lm_smoothed = LabelSmoothingLoss(
+                config.label_smoothing, config.vocab_size, ignore_index=0, reduction='none')
+        else:
+            self.crit_mask_lm_smoothed = None
+        self.init_weights()
+        self.tie_weights()
+
+    def tie_weights(self):
+        """ Make sure we are sharing the input and output embeddings.
+            Export to TorchScript can't handle parameter sharing so we are cloning them instead.
+        """
+        self._tie_or_clone_weights(self.cls.predictions.decoder,
+                                   self.bert.embeddings.word_embeddings)
+
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, masked_lm_labels=None, 
+                masked_pos=None, masked_weights=None, num_tokens_a=None, num_tokens_b=None):
+        sequence_output, __ = self.bert(
+            input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+
+        def gather_seq_out_by_pos(seq, pos):
+            return torch.gather(seq, 1, pos.unsqueeze(2).expand(-1, -1, seq.size(-1)))
+
+        def gather_seq_out_by_pos_average(seq, pos, mask):
+            batch_size, max_token_num = pos.size(0), pos.size(-1)
+            pos_vec = torch.gather(seq, 1, pos.view(batch_size, -1).unsqueeze(2).expand(-1, 
+                -1, seq.size(-1))).view(batch_size, -1, max_token_num, seq.size(-1))
+            mask = mask.type_as(pos_vec)
+            pos_vec_masked_sum = (
+                pos_vec * mask.unsqueeze(3).expand_as(pos_vec)).sum(2)
+            return pos_vec_masked_sum / mask.sum(2, keepdim=True).expand_as(pos_vec_masked_sum)
+
+        def loss_mask_and_normalize(loss, mask):
+            mask = mask.type_as(loss) 
+            loss = loss * mask
+            denominator = torch.sum(mask) + 1e-5
+            return (loss / denominator).sum()
+
+        if masked_lm_labels is None:
+            if masked_pos is None:
+                prediction_scores = self.cls(sequence_output)
+            else:
+                sequence_output_masked = gather_seq_out_by_pos(
+                    sequence_output, masked_pos)
+                prediction_scores = self.cls(sequence_output_masked)
+            return prediction_scores
+
+        sequence_output_masked = gather_seq_out_by_pos(
+            sequence_output, masked_pos)
+        prediction_scores_masked = self.cls(sequence_output_masked)
+        if self.crit_mask_lm_smoothed:
+            masked_lm_loss = self.crit_mask_lm_smoothed(
+                F.log_softmax(prediction_scores_masked.float(), dim=-1), masked_lm_labels)
+        else:
+            masked_lm_loss = self.crit_mask_lm(
+                prediction_scores_masked.transpose(1, 2).float(), masked_lm_labels)
+        masked_lm_loss = loss_mask_and_normalize(
+            masked_lm_loss.float(), masked_weights)
+
+        return masked_lm_loss
 
